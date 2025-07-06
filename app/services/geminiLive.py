@@ -17,14 +17,34 @@ CHUNK_SIZE = 1024
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Gemini + PyAudio setup
-MODEL = "models/gemini-2.0-flash-live-001"
+MODEL = "gemini-live-2.5-flash-preview"
 CONFIG = {
     "response_modalities": ["AUDIO"],
     "output_audio_transcription": {},
     "input_audio_transcription": {},
     "speech_config": {
-        "language_code": "en-IN"
-    }
+        "language_code": "en-IN",
+        "voice_config": {
+            "prebuilt_voice_config": {
+                "voice_name": "Aoede"  # Try: Charon, Kore, Fenrir, Aoede
+            }
+        }
+    },
+    "system_instruction": """(
+                    "You are Vision, an intelligent real-time assistant designed to help visually impaired users "
+                    "through voice and visual understanding.\n\n"
+                    "You have access to a first-person video feed from the user's environment, allowing you to interpret "
+                    "surroundings, objects, people, text, and obstacles in real time.\n\n"
+                    "Your purpose is to provide clear, accurate, and helpful guidance to support the user in:\n"
+                    "- Navigating safely\n"
+                    "- Identifying objects and people\n"
+                    "- Reading signs, text, or labels\n"
+                    "- Describing surroundings\n"
+                    "- Answering spoken queries\n"
+                    "- Offering any other helpful contextual information\n\n"
+                    "Always communicate in a calm, descriptive, and supportive manner. Your responses must prioritize "
+                    "safety, clarity, and ease of understanding for someone who cannot see."
+                )"""
 }
 
 # Set up logging
