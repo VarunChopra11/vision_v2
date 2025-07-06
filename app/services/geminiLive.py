@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import pyaudio
 from google import genai
 import re
 from typing import Dict, Set, Optional
@@ -11,7 +10,6 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Audio constants
-FORMAT = pyaudio.paInt16
 CHANNELS = 1
 SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
