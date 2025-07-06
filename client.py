@@ -5,13 +5,17 @@ import base64
 import cv2
 from PIL import Image
 import io
+import os
 import json
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
 
 # --- Configuration ---
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000 # For sending audio
-WEBSOCKET_URI = "ws://localhost:8000/ws" 
+WEBSOCKET_URI = os.getenv("WEBSOCKET_URI", "ws://localhost:8000/ws")
 CHUNK = 1024
 
 
