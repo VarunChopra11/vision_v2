@@ -1,0 +1,6 @@
+websockets==15.0.1
+PyAudio==0.2.14
+opencv-python==4.11.0.86
+Pillow==11.3.0
+numpy==2.3.1
+python-dotenv==1.1.1
