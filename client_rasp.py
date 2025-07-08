@@ -2,11 +2,11 @@ import asyncio
 import websockets
 import pyaudio
 import base64
-import cv2
 import os
 import json
 from dotenv import load_dotenv
 import time
+import cv2
 import io
 import numpy as np
 
@@ -26,16 +26,15 @@ CHANNELS = 1
 RATE = 16000
 WEBSOCKET_URI = os.getenv("WEBSOCKET_URI", "ws://localhost:8000/ws")
 CHUNK = 1024
-FRAME_RATE = 15  # Reduced FPS target for Pi
-RESOLUTION = (640, 480)  # Maintain resolution but use efficient encoding
-
-# Camera settings for brightness/quality
-BRIGHTNESS = 70  # Increased brightness (0-100)
-CONTRAST = 70    # Increased contrast (0-100)
-QUALITY = 85     # JPEG quality (1-100)
+FRAME_RATE = 12  # Optimized for Pi 3B
+RESOLUTION = (640, 480)
+BRIGHTNESS = 70
+CONTRAST = 70
+QUALITY = 80
+MAX_QUEUE_SIZE = 2  # Backpressure control
 
 class PiCameraWrapper:
-    """Wrapper for efficient PiCamera capture on Raspberry Pi"""
+    """Optimized PiCamera capture with hardware encoding"""
     def __init__(self):
         self.camera = PiCamera()
         self.camera.resolution = RESOLUTION
@@ -45,14 +44,17 @@ class PiCameraWrapper:
         self.raw_capture = PiRGBArray(self.camera, size=RESOLUTION)
         self.stream = self.camera.capture_continuous(
             self.raw_capture, 
-            format="bgr", 
-            use_video_port=True
+            format="jpeg",  # Use JPEG for hardware acceleration
+            use_video_port=True,
+            quality=QUALITY
         )
+        self.last_frame_time = time.time()
         
     def read(self):
-        frame = next(self.stream).array
+        frame = next(self.stream)
+        jpeg_data = frame.array
         self.raw_capture.truncate(0)
-        return True, frame
+        return True, jpeg_data
     
     def release(self):
         self.stream.close()
@@ -68,12 +70,18 @@ class OpenCVCamera:
         self.cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
         self.cap.set(cv2.CAP_PROP_BRIGHTNESS, BRIGHTNESS/100)
         self.cap.set(cv2.CAP_PROP_CONTRAST, CONTRAST/100)
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # Enable auto exposure
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, 0.25)    # Increase exposure for brightness
         
     def read(self):
         ret, frame = self.cap.read()
         if not ret:
             return False, None
-        return True, frame
+        
+        # Adjust brightness/contrast
+        frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=25)
+        _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), QUALITY])
+        return True, jpeg.tobytes()
     
     def release(self):
         self.cap.release()
@@ -82,16 +90,6 @@ class OpenCVCamera:
 async def run_in_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-
-
-def encode_frame(frame):
-    """Efficient JPEG encoding with brightness adjustment"""
-    # Adjust brightness/contrast
-    frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=20)
-    
-    # Encode directly to JPEG
-    _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), QUALITY])
-    return base64.b64encode(jpeg).decode('utf-8')
 
 
 async def send_audio_and_video(uri):
@@ -106,6 +104,7 @@ async def send_audio_and_video(uri):
 
     stream_play = None
     is_playing_audio = asyncio.Event()
+    video_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 
     # Initialize camera
     if USE_PICAMERA:
@@ -139,44 +138,78 @@ async def send_audio_and_video(uri):
 
             print("Starting streams...")
             last_frame_time = time.time()
+            frame_count = 0
+            start_time = time.time()
+
+            async def capture_video():
+                """Dedicated video capture with timing control"""
+                nonlocal last_frame_time, frame_count
+                try:
+                    while True:
+                        current_time = time.time()
+                        elapsed = current_time - last_frame_time
+                        target_interval = 1.0 / FRAME_RATE
+                        
+                        if elapsed < target_interval:
+                            await asyncio.sleep(target_interval - elapsed)
+                            
+                        success, jpeg_data = await run_in_thread(camera.read)
+                        if not success:
+                            await asyncio.sleep(0.01)
+                            continue
+                            
+                        try:
+                            video_queue.put_nowait(jpeg_data)
+                        except asyncio.QueueFull:
+                            # Drop frame if queue full to prevent backlog
+                            pass
+                            
+                        last_frame_time = time.time()
+                        frame_count += 1
+                        
+                except Exception as e:
+                    print(f"Video capture error: {e}")
 
             async def send_audio():
-                """Send audio chunks when not playing back AI audio"""
+                """Audio streaming with backpressure"""
                 try:
                     while True:
                         if is_playing_audio.is_set():
                             await asyncio.sleep(0.05)
                             continue
+                            
                         data = await run_in_thread(
                             stream_send.read, CHUNK, exception_on_overflow=False
                         )
                         encoded = base64.b64encode(data).decode("utf-8")
                         await ws.send(json.dumps({"type": "audio", "data": encoded}))
+                        
+                        # Maintain audio timing
+                        await asyncio.sleep(CHUNK / RATE)
+                        
                 except Exception as e:
                     print(f"Audio send error: {e}")
 
             async def send_video():
-                """Optimized video streaming with FPS control"""
+                """Video sending with queue-based backpressure"""
                 try:
                     while True:
-                        start_time = time.time()
-                        success, frame = await run_in_thread(camera.read)
+                        jpeg_data = await video_queue.get()
+                        encoded = base64.b64encode(jpeg_data).decode('utf-8')
                         
-                        if not success:
-                            await asyncio.sleep(0.01)
-                            continue
+                        # Send both frame types in one go
+                        await asyncio.gather(
+                            ws.send(json.dumps({"type": "frame", "data": encoded})),
+                            ws.send(json.dumps({"type": "frame-to-show", "data": encoded}))
+                        )
+                        
+                        # Report FPS periodically
+                        if time.time() - start_time > 5:
+                            fps = frame_count / (time.time() - start_time)
+                            print(f"📹 Streaming at {fps:.1f} FPS")
+                            frame_count = 0
+                            start_time = time.time()
                             
-                        encoded = await run_in_thread(encode_frame, frame)
-                        
-                        # Send both frame types efficiently
-                        await ws.send(json.dumps({"type": "frame", "data": encoded}))
-                        await ws.send(json.dumps({"type": "frame-to-show", "data": encoded}))
-                        
-                        # Dynamic sleep for FPS control
-                        elapsed = time.time() - start_time
-                        sleep_time = max(0, (1.0 / FRAME_RATE) - elapsed)
-                        await asyncio.sleep(sleep_time)
-                        
                 except Exception as e:
                     print(f"Video send error: {e}")
 
@@ -202,9 +235,9 @@ async def send_audio_and_video(uri):
                                     output=True,
                                 )
 
-                            await run_in_thread(stream_play.write, audio_data)
+                            stream_play.write(audio_data)
                             is_playing_audio.clear()
-                            print("🔊 Playing audio")
+                            # print("🔊 Playing audio")
 
                         elif msg_type == "ai":
                             print(f"🤖 AI: {msg_json['data']}")
@@ -215,6 +248,7 @@ async def send_audio_and_video(uri):
 
             # Run all tasks concurrently
             await asyncio.gather(
+                capture_video(),
                 send_audio(),
                 send_video(),
                 receive_messages(),
@@ -231,6 +265,7 @@ async def send_audio_and_video(uri):
             stream_play.close()
         audio.terminate()
         camera.release()
+        print("Resources released")
 
 
 if __name__ == "__main__":
