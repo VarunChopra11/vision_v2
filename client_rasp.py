@@ -6,9 +6,7 @@ import os
 import json
 from dotenv import load_dotenv
 import time
-import cv2
-import io
-import numpy as np
+import logging
 
 # Conditional import for PiCamera
 try:
@@ -17,6 +15,7 @@ try:
     USE_PICAMERA = True
 except (ImportError, OSError):
     USE_PICAMERA = False
+    import cv2
 
 load_dotenv(override=True)
 
@@ -26,12 +25,17 @@ CHANNELS = 1
 RATE = 16000
 WEBSOCKET_URI = os.getenv("WEBSOCKET_URI", "ws://localhost:8000/ws")
 CHUNK = 1024
-FRAME_RATE = 12  # Optimized for Pi 3B
+FRAME_RATE = 15  # Optimized for Pi 3B
 RESOLUTION = (640, 480)
 BRIGHTNESS = 70
 CONTRAST = 70
 QUALITY = 80
 MAX_QUEUE_SIZE = 2  # Backpressure control
+AUDIO_BUFFER_SIZE = 1024 * 4  # Smaller buffer for lower latency
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class PiCameraWrapper:
     """Optimized PiCamera capture with hardware encoding"""
@@ -48,23 +52,34 @@ class PiCameraWrapper:
             use_video_port=True,
             quality=QUALITY
         )
-        self.last_frame_time = time.time()
         
     def read(self):
-        frame = next(self.stream)
-        jpeg_data = frame.array
-        self.raw_capture.truncate(0)
-        return True, jpeg_data
+        try:
+            frame = next(self.stream)
+            jpeg_data = frame.array
+            self.raw_capture.truncate(0)
+            return True, jpeg_data
+        except StopIteration:
+            return False, None
+        except Exception as e:
+            logger.error(f"Camera read error: {e}")
+            return False, None
     
     def release(self):
-        self.stream.close()
-        self.raw_capture.close()
-        self.camera.close()
+        try:
+            self.stream.close()
+            self.raw_capture.close()
+            self.camera.close()
+        except Exception as e:
+            logger.error(f"Camera release error: {e}")
 
 class OpenCVCamera:
     """Fallback camera for non-Raspberry Pi systems"""
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            raise RuntimeError("Could not open camera")
+            
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
         self.cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
@@ -74,17 +89,24 @@ class OpenCVCamera:
         self.cap.set(cv2.CAP_PROP_EXPOSURE, 0.25)    # Increase exposure for brightness
         
     def read(self):
-        ret, frame = self.cap.read()
-        if not ret:
+        try:
+            ret, frame = self.cap.read()
+            if not ret:
+                return False, None
+            
+            # Adjust brightness/contrast
+            frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=25)
+            _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), QUALITY])
+            return True, jpeg.tobytes()
+        except Exception as e:
+            logger.error(f"OpenCV camera error: {e}")
             return False, None
-        
-        # Adjust brightness/contrast
-        frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=25)
-        _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), QUALITY])
-        return True, jpeg.tobytes()
     
     def release(self):
-        self.cap.release()
+        try:
+            self.cap.release()
+        except Exception as e:
+            logger.error(f"OpenCV release error: {e}")
 
 
 async def run_in_thread(func, *args, **kwargs):
@@ -107,17 +129,22 @@ async def send_audio_and_video(uri):
     video_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 
     # Initialize camera
-    if USE_PICAMERA:
-        print("Using PiCamera for optimized performance")
-        camera = PiCameraWrapper()
-    else:
-        print("Using OpenCV camera")
-        camera = OpenCVCamera()
+    camera = None
+    try:
+        if USE_PICAMERA:
+            logger.info("Using PiCamera for optimized performance")
+            camera = PiCameraWrapper()
+        else:
+            logger.info("Using OpenCV camera")
+            camera = OpenCVCamera()
+    except Exception as e:
+        logger.error(f"Camera initialization failed: {e}")
+        return
 
-    print(f"Connecting to {uri}...")
+    logger.info(f"Connecting to {uri}...")
     try:
         async with websockets.connect(uri, max_size=None, ping_interval=None) as ws:
-            print("Connected! Setting role as broadcaster...")
+            logger.info("Connected! Setting role as broadcaster...")
             await ws.send(json.dumps({"type": "set_role", "role": "broadcaster"}))
 
             # Wait for role confirmation
@@ -127,32 +154,24 @@ async def send_audio_and_video(uri):
                     message = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     msg_json = json.loads(message)
                     if msg_json.get("type") == "role_confirmed":
-                        print(f"Role confirmed: {msg_json.get('role')}")
+                        logger.info(f"Role confirmed: {msg_json.get('role')}")
                         role_confirmed = True
                     elif msg_json.get("type") == "role_error":
-                        print(f"Role error: {msg_json.get('message')}")
+                        logger.error(f"Role error: {msg_json.get('message')}")
                         return
                 except asyncio.TimeoutError:
-                    print("Timeout waiting for role confirmation")
+                    logger.error("Timeout waiting for role confirmation")
                     return
 
-            print("Starting streams...")
-            last_frame_time = time.time()
-            frame_count = 0
-            start_time = time.time()
+            logger.info("Starting streams...")
 
             async def capture_video():
                 """Dedicated video capture with timing control"""
-                nonlocal last_frame_time, frame_count
                 try:
+                    target_delay = 1.0 / FRAME_RATE
                     while True:
-                        current_time = time.time()
-                        elapsed = current_time - last_frame_time
-                        target_interval = 1.0 / FRAME_RATE
+                        start_capture = time.monotonic()
                         
-                        if elapsed < target_interval:
-                            await asyncio.sleep(target_interval - elapsed)
-                            
                         success, jpeg_data = await run_in_thread(camera.read)
                         if not success:
                             await asyncio.sleep(0.01)
@@ -164,57 +183,75 @@ async def send_audio_and_video(uri):
                             # Drop frame if queue full to prevent backlog
                             pass
                             
-                        last_frame_time = time.time()
-                        frame_count += 1
+                        # Calculate time to maintain frame rate
+                        elapsed = time.monotonic() - start_capture
+                        sleep_time = max(0, target_delay - elapsed)
+                        await asyncio.sleep(sleep_time)
                         
                 except Exception as e:
-                    print(f"Video capture error: {e}")
+                    logger.error(f"Video capture error: {e}")
 
             async def send_audio():
-                """Audio streaming with backpressure"""
+                """Audio streaming with precise timing"""
                 try:
+                    chunk_duration = CHUNK / RATE  # Time per chunk in seconds
+                    last_send_time = time.monotonic()
+                    
                     while True:
+                        # Skip audio if playing back Gemini audio
                         if is_playing_audio.is_set():
-                            await asyncio.sleep(0.05)
+                            await asyncio.sleep(0.01)
                             continue
                             
+                        # Read audio data
                         data = await run_in_thread(
                             stream_send.read, CHUNK, exception_on_overflow=False
                         )
                         encoded = base64.b64encode(data).decode("utf-8")
+                        
+                        # Send with precise timing
                         await ws.send(json.dumps({"type": "audio", "data": encoded}))
                         
-                        # Maintain audio timing
-                        await asyncio.sleep(CHUNK / RATE)
+                        # Maintain exact timing
+                        current_time = time.monotonic()
+                        elapsed = current_time - last_send_time
+                        sleep_time = max(0, chunk_duration - elapsed)
+                        await asyncio.sleep(sleep_time)
+                        last_send_time = time.monotonic() + max(0, elapsed - chunk_duration)
                         
                 except Exception as e:
-                    print(f"Audio send error: {e}")
+                    logger.error(f"Audio send error: {e}")
 
             async def send_video():
-                """Video sending with queue-based backpressure"""
+                """Video sending with queue-based backpressure and FPS monitoring"""
+                start_time = time.monotonic()
+                frame_count = 0
+                
                 try:
                     while True:
                         jpeg_data = await video_queue.get()
                         encoded = base64.b64encode(jpeg_data).decode('utf-8')
                         
-                        # Send both frame types in one go
+                        # Send both frame types efficiently
                         await asyncio.gather(
                             ws.send(json.dumps({"type": "frame", "data": encoded})),
                             ws.send(json.dumps({"type": "frame-to-show", "data": encoded}))
                         )
                         
                         # Report FPS periodically
-                        if time.time() - start_time > 5:
-                            fps = frame_count / (time.time() - start_time)
-                            print(f"📹 Streaming at {fps:.1f} FPS")
+                        frame_count += 1
+                        elapsed = time.monotonic() - start_time
+                        if elapsed > 5.0:
+                            fps = frame_count / elapsed
+                            logger.info(f"📹 Streaming at {fps:.1f} FPS")
                             frame_count = 0
-                            start_time = time.time()
+                            start_time = time.monotonic()
                             
                 except Exception as e:
-                    print(f"Video send error: {e}")
+                    logger.error(f"Video send error: {e}")
 
             async def receive_messages():
-                """Handle incoming messages from server"""
+                """Handle incoming messages from server with low-latency audio"""
                 nonlocal stream_play
                 try:
                     while True:
@@ -233,18 +270,22 @@ async def send_audio_and_video(uri):
                                     channels=CHANNELS,
                                     rate=sample_rate,
                                     output=True,
+                                    frames_per_buffer=AUDIO_BUFFER_SIZE  # Smaller buffer for lower latency
                                 )
 
-                            stream_play.write(audio_data)
+                            # Write in thread to avoid blocking
+                            await run_in_thread(stream_play.write, audio_data)
                             is_playing_audio.clear()
-                            # print("🔊 Playing audio")
+                            logger.info("🔊 Playing audio")
 
                         elif msg_type == "ai":
-                            print(f"🤖 AI: {msg_json['data']}")
+                            logger.info(f"🤖 AI: {msg_json['data']}")
                         elif msg_type == "error":
-                            print(f"❌ Error: {msg_json['data']}")
+                            logger.error(f"❌ Error: {msg_json['data']}")
                 except websockets.exceptions.ConnectionClosed:
-                    print("WebSocket closed")
+                    logger.info("WebSocket closed")
+                except Exception as e:
+                    logger.error(f"Message receive error: {e}")
 
             # Run all tasks concurrently
             await asyncio.gather(
@@ -255,21 +296,32 @@ async def send_audio_and_video(uri):
             )
 
     except Exception as e:
-        print(f"Connection error: {e}")
+        logger.error(f"Connection error: {e}")
     finally:
-        print("Cleaning up...")
-        stream_send.stop_stream()
-        stream_send.close()
+        logger.info("Cleaning up resources...")
+        try:
+            stream_send.stop_stream()
+            stream_send.close()
+        except:
+            pass
+            
         if stream_play:
-            stream_play.stop_stream()
-            stream_play.close()
+            try:
+                stream_play.stop_stream()
+                stream_play.close()
+            except:
+                pass
+                
         audio.terminate()
-        camera.release()
-        print("Resources released")
+        
+        if camera:
+            camera.release()
+            
+        logger.info("All resources released")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(send_audio_and_video(WEBSOCKET_URI))
     except KeyboardInterrupt:
-        print("Exit")
+        logger.info("Exit")
