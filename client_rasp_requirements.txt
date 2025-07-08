@@ -1,0 +1,4 @@
+sudo apt update
+
+# Install libcamera & Picamera2 + OpenCV
+sudo apt install -y python3-picamera2 python3-opencv libatlas-base-dev ffmpeg libjpeg-dev libopenjp2-7 libtiff5 libavcodec-dev libavformat-dev libswscale-dev
