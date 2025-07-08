@@ -19,10 +19,10 @@ WEBSOCKET_URI = os.getenv("WEBSOCKET_URI", "ws://localhost:8000/ws")
 CHUNK = 1024
 
 
-async def run_in_thread(func, *args):
+async def run_in_thread(func, *args, **kwargs):
     """Run blocking function in thread pool (replacement for asyncio.to_thread)"""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, func, *args)
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
 async def send_audio_and_video(uri):
