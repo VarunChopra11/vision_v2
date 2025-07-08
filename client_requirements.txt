@@ -2,5 +2,5 @@ websockets
 PyAudio
 # opencv-python-headless==4.5.5.64 Commented out for raspberry pi compatibility issues, uncomment if needed
 Pillow
-numpy
+# numpy Commented out for raspberry pi compatibility issues, uncomment if needed
 python-dotenv
