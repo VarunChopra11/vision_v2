@@ -16,3 +16,11 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info(f"Client {client_id} disconnected")
     except Exception as e:
         logger.error(f"Error with client {client_id}: {e}")
+
+@router.get("/wakeup")
+async def wakeup():
+    """
+    Simple endpoint to check if the service is running.
+    Returns a simple message to confirm the API is awake.
+    """
+    return {"status": "awake", "message": "Service is up and running"}
