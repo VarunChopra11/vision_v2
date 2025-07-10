@@ -80,90 +80,41 @@ async def send_audio_and_video(uri):
 
             print("Starting audio/video streams...")
 
-            async def send_audio():
+            async def stream_media():
                 try:
-                    while True:
-                        if is_playing_audio.is_set():
-                            await asyncio.sleep(0.05)
+                   while True:
+                        # 1. Handle Video
+                        ret, frame = await run_in_thread(cap.read)
+                        if not ret:
+                            await asyncio.sleep(0.01)
                             continue
-                        data = await run_in_thread(
+
+                        def encode_frame(frame_to_encode):
+                            rgb = cv2.cvtColor(frame_to_encode, cv2.COLOR_BGR2RGB)
+                            img = Image.fromarray(rgb)
+                            img.thumbnail((640, 480))
+                            buf = io.BytesIO()
+                            img.save(buf, format="JPEG")
+                            return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+                        encoded_frame = await run_in_thread(encode_frame, frame)
+
+                        await ws.send(json.dumps({"type": "frame", "data": encoded_frame}))
+                        await ws.send(json.dumps({"type": "frame-to-show", "data": encoded_frame}))
+
+                        # 2. Handle Audio
+                        if is_playing_audio.is_set():
+                             await asyncio.sleep(0.05)
+                        audio_data = await run_in_thread(
                             stream_send.read, CHUNK, exception_on_overflow=False
                         )
-                        encoded = base64.b64encode(data).decode("utf-8")
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "audio",
-                                    "data": encoded,
-                                }
-                            )
-                        )
-                except Exception as e:
-                    print(f"Error in send_audio: {e}")
+                        encoded_audio = base64.b64encode(audio_data).decode("utf-8")
+                        await ws.send(json.dumps({"type": "audio", "data": encoded_audio}))
 
-            async def send_video():
-                try:
-                    while True:
-                        ret, frame = await run_in_thread(cap.read)
-                        if not ret:
-                            await asyncio.sleep(0.01)  # Small sleep to prevent busy-waiting
-                            continue
-
-                        def encode_frame(frame_to_encode):
-                            rgb = cv2.cvtColor(frame_to_encode, cv2.COLOR_BGR2RGB)
-                            img = Image.fromarray(rgb)
-                            img.thumbnail((640, 480))
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG")
-                            return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-                        encoded = await run_in_thread(encode_frame, frame)
-
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "frame",
-                                    "data": encoded,
-                                }
-                            )
-                        )
-
+                        # 3. Pace the loop
                         await asyncio.sleep(0.04)  # ~25 FPS
-
                 except Exception as e:
-                    print(f"Error in send_video: {e}")
-
-            async def send_video_to_show():
-                try:
-                    while True:
-                        ret, frame = await run_in_thread(cap.read)
-                        if not ret:
-                            await asyncio.sleep(0.01)  # Small sleep to prevent busy-waiting
-                            continue
-
-                        def encode_frame(frame_to_encode):
-                            rgb = cv2.cvtColor(frame_to_encode, cv2.COLOR_BGR2RGB)
-                            img = Image.fromarray(rgb)
-                            img.thumbnail((640, 480))
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG")
-                            return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-                        encoded = await run_in_thread(encode_frame, frame)
-
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "frame-to-show",
-                                    "data": encoded,
-                                }
-                            )
-                        )
-
-                        await asyncio.sleep(0.04)  # ~25 FPS
-
-                except Exception as e:
-                    print(f"Error in send_video_to_show: {e}")
+                    print(f"Error in stream_media: {e}")
 
             async def receive_messages():
                 nonlocal stream_play  # Allow modification of stream_play from outer scope
@@ -215,10 +166,8 @@ async def send_audio_and_video(uri):
 
             # Run all tasks concurrently
             await asyncio.gather(
-                send_audio(),
-                send_video(),
+                stream_media(),
                 receive_messages(),
-                send_video_to_show(),
             )
 
     except websockets.exceptions.ConnectionClosed as e:

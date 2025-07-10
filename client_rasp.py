@@ -219,22 +219,9 @@ async def send_audio_and_video(uri):
             audio_manager.initialize_streams()
             print("Starting streams...")
 
-            async def send_audio():
-                """Optimized audio sending with proper buffering"""
-                try:
-                    while True:
-                        audio_data = audio_manager.get_audio_data()
-                        if audio_data:
-                            encoded = base64.b64encode(audio_data).decode("utf-8")
-                            await ws.send(json.dumps({"type": "audio", "data": encoded}))
-                        await asyncio.sleep(0.01)  # Small delay to prevent overwhelming
-                except Exception as e:
-                    print(f"Audio send error: {e}")
-
-            async def send_video():
+            async def send_media():
                 """Optimized video streaming with frame skipping"""
                 try:
-                    frame_skip_counter = 0
                     target_interval = 1.0 / FRAME_RATE
                     
                     while True:
@@ -244,15 +231,18 @@ async def send_audio_and_video(uri):
                         if not success:
                             await asyncio.sleep(0.01)
                             continue
-                            
-                        # Skip frames if we're behind
-                        frame_skip_counter += 1
-                        if frame_skip_counter % 2 == 0:  # Send every other frame if needed
-                            encoded = frame_encoder.encode_frame(frame)
-                            if encoded:
-                                # Send frame data
-                                await ws.send(json.dumps({"type": "frame", "data": encoded}))
-                                await ws.send(json.dumps({"type": "frame-to-show", "data": encoded}))
+                        
+                        encoded_frame = frame_encoder.encode_frame(frame)
+                        if encoded_frame:
+                            # Send frame data for Gemini
+                            await ws.send(json.dumps({"type": "frame", "data": encoded_frame}))
+                            # Send the same frame for receivers to display
+                            await ws.send(json.dumps({"type": "frame-to-show", "data": encoded_frame}))
+
+                        # Now, send all buffered audio since the last frame
+                        while audio_data := audio_manager.get_audio_data():
+                            encoded_audio = base64.b64encode(audio_data).decode("utf-8")
+                            await ws.send(json.dumps({"type": "audio", "data": encoded_audio}))
                         
                         # Adaptive timing
                         elapsed = time.time() - start_time
@@ -305,8 +295,7 @@ async def send_audio_and_video(uri):
 
             # Run all tasks concurrently
             await asyncio.gather(
-                send_audio(),
-                send_video(),
+                send_media(),
                 receive_messages(),
                 return_exceptions=True
             )
