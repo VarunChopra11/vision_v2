@@ -7,10 +7,10 @@ import os
 import json
 from dotenv import load_dotenv
 import time
-import io
 import numpy as np
 from collections import deque
 import threading
+import concurrent.futures
 
 # Conditional import for PiCamera
 try:
@@ -35,6 +35,10 @@ RESOLUTION = (640, 480)
 BRIGHTNESS = 70
 CONTRAST = 70
 QUALITY = 85
+
+# Video stream settings
+DISPLAY_FPS = 15  # For viewer display
+GEMINI_FPS = 3    # Lower FPS for AI processing
 
 # Audio buffer settings
 AUDIO_BUFFER_SIZE = 10  # Maximum audio chunks to buffer
@@ -171,9 +175,6 @@ class FrameEncoder:
         
     def encode_frame(self, frame):
         """Optimized frame encoding"""
-        # Enhance frame quality
-        frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=15)
-        
         # Encode to JPEG
         success, jpeg = cv2.imencode('.jpg', frame, self.encode_params)
         if not success:
@@ -219,6 +220,40 @@ async def send_audio_and_video(uri):
             audio_manager.initialize_streams()
             print("Starting streams...")
 
+            # Create thread pool for CPU-intensive tasks
+            loop = asyncio.get_running_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+            
+            # Frame queues for different streams
+            display_queue = asyncio.Queue(maxsize=2)
+            gemini_queue = asyncio.Queue(maxsize=1)  # Only keep latest frame for Gemini
+
+            async def capture_frames():
+                """Capture frames and distribute to appropriate queues"""
+                gemini_frame_interval = 1.0 / GEMINI_FPS
+                last_gemini_frame_time = time.time()
+                
+                while True:
+                    success, frame = camera.read()
+                    if not success:
+                        await asyncio.sleep(0.01)
+                        continue
+                    
+                    # Always queue frame for display
+                    if display_queue.full():
+                        display_queue.get_nowait()
+                    display_queue.put_nowait(frame.copy())
+                    
+                    # Only queue frame for Gemini at reduced FPS
+                    current_time = time.time()
+                    if current_time - last_gemini_frame_time >= gemini_frame_interval:
+                        if gemini_queue.full():
+                            gemini_queue.get_nowait()
+                        gemini_queue.put_nowait(frame.copy())
+                        last_gemini_frame_time = current_time
+                    
+                    await asyncio.sleep(1/FRAME_RATE)
+
             async def send_audio():
                 """Optimized audio sending with proper buffering"""
                 try:
@@ -231,36 +266,41 @@ async def send_audio_and_video(uri):
                 except Exception as e:
                     print(f"Audio send error: {e}")
 
-            async def send_video():
-                """Optimized video streaming with frame skipping"""
+            async def send_display_frames():
+                """Send frames for display at full frame rate"""
                 try:
-                    frame_skip_counter = 0
-                    target_interval = 1.0 / FRAME_RATE
-                    
                     while True:
-                        start_time = time.time()
-                        
-                        success, frame = camera.read()
-                        if not success:
-                            await asyncio.sleep(0.01)
-                            continue
-                            
-                        # Skip frames if we're behind
-                        frame_skip_counter += 1
-                        if frame_skip_counter % 2 == 0:  # Send every other frame if needed
-                            encoded = frame_encoder.encode_frame(frame)
-                            if encoded:
-                                # Send frame data
-                                await ws.send(json.dumps({"type": "frame", "data": encoded}))
-                                await ws.send(json.dumps({"type": "frame-to-show", "data": encoded}))
-                        
-                        # Adaptive timing
-                        elapsed = time.time() - start_time
-                        sleep_time = max(0.001, target_interval - elapsed)
-                        await asyncio.sleep(sleep_time)
-                        
+                        frame = await display_queue.get()
+                        encoded = await loop.run_in_executor(
+                            executor, 
+                            frame_encoder.encode_frame, 
+                            frame
+                        )
+                        if encoded:
+                            await ws.send(json.dumps({
+                                "type": "frame-to-show", 
+                                "data": encoded
+                            }))
                 except Exception as e:
-                    print(f"Video send error: {e}")
+                    print(f"Display frame send error: {e}")
+
+            async def send_gemini_frames():
+                """Send frames to Gemini at reduced frame rate"""
+                try:
+                    while True:
+                        frame = await gemini_queue.get()
+                        encoded = await loop.run_in_executor(
+                            executor, 
+                            frame_encoder.encode_frame, 
+                            frame
+                        )
+                        if encoded:
+                            await ws.send(json.dumps({
+                                "type": "frame", 
+                                "data": encoded
+                            }))
+                except Exception as e:
+                    print(f"Gemini frame send error: {e}")
 
             async def receive_messages():
                 """Handle incoming messages with reduced latency"""
@@ -305,8 +345,10 @@ async def send_audio_and_video(uri):
 
             # Run all tasks concurrently
             await asyncio.gather(
+                capture_frames(),
                 send_audio(),
-                send_video(),
+                send_display_frames(),
+                send_gemini_frames(),
                 receive_messages(),
                 return_exceptions=True
             )
@@ -317,6 +359,7 @@ async def send_audio_and_video(uri):
         print("Cleaning up...")
         audio_manager.cleanup()
         camera.release()
+        executor.shutdown(wait=False)
 
 if __name__ == "__main__":
     try:
