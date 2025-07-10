@@ -327,7 +327,7 @@ async def send_audio_and_video(uri):
                                 if len(chunk) == chunk_size:  # Only queue full chunks
                                     audio_manager.queue_playback_audio(chunk)
                             
-                            print("🔊 Playing audio")
+                            # print("🔊 Playing audio")
                             
                             # Stop playback after a short delay
                             await asyncio.sleep(0.1)
